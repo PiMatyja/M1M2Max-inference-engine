@@ -1,0 +1,29 @@
+# build output
+build*/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# fetched at build time by scripts/fetch-deps.sh, never committed
+/third_party/metal-cpp/
+/third_party/metal-cpp.unpack/
+/third_party/llama.cpp/
+/third_party/*.zip
+
+# the model, the packs and the run config written on this machine
+/models/
+/packs/
+/mtp/
+strata-models/
+/strata-*.json
+*.log
+
+# macOS and editors
+.DS_Store
+.vscode/
+.idea/
+
+# downloaded source archives and local benchmark output
+/sdists/
+strata-bench/

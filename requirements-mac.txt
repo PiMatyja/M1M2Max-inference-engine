@@ -1,0 +1,25 @@
+# Python packages for the server and the pack tools, built from source archives only (no wheels).
+# Every line is pinned to one version and its sdist SHA-256 from PyPI, so pip refuses anything else.
+# scripts/python-env.sh installs them into a venv made from Homebrew python 3.14: it downloads every archive with
+#   .venv/bin/pip download --no-binary :all: --no-deps --require-hashes -r requirements-mac.txt -d .venv/sdists
+# then installs them one at a time, in the order below, with --no-deps --no-build-isolation --no-index.
+# --no-build-isolation means the build backends (setuptools, flit-core) must already be in the venv, so they come first.
+# pip itself must be new enough to know Python 3.14 (pip 25.2 or newer; Homebrew python 3.14 ships one).
+
+# Build backend for markupsafe, pyyaml and regex.
+setuptools==84.0.0 --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
+
+# Build backend for jinja2 and markupsafe (PEP 517 flit).
+flit-core==4.1.0 --hash=sha256:62e12b63ead8335b37f59fabb977c7167fe476dafb5e41785dfa8c9aff843bc6
+
+# Escaping used by jinja2 when it renders the chat template.
+markupsafe==3.0.3 --hash=sha256:722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698
+
+# Renders serve/chat_template.jinja into the prompt the engine sees.
+jinja2==3.1.6 --hash=sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d
+
+# YAML reader; llama.cpp's gguf-py (used by the pack tools) imports it at load time.
+pyyaml==6.0.3 --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
+
+# Regex engine the tokenizer (tools/strata_tokenizer.py) uses for its pre-tokenizer split.
+regex==2026.9.10 --hash=sha256:1e321e2c84f0e52c457f5ea5944f796d6e8e09cb99738ea98dcc1bfe402a128d

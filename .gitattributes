@@ -1,0 +1,5 @@
+# scripts keep LF wherever the repository is cloned
+*.sh text eol=lf
+
+# the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
+data/quant_quality/** -text
