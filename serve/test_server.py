@@ -4765,8 +4765,7 @@ class LostStep(unittest.TestCase):
 
 
 class ImageSources(unittest.TestCase):
-    """What an image source may name: never a network path (Windows signs in to the host at the first look), a URL up
-    to IMAGE_URL_MAX and downloaded outside the request FIFO, a file on this computer not for a page of another site."""
+    """Image sources reject network paths and URLs before any network access."""
 
     NETWORK = [r"\\host\share\x.png", "//host/share/x.png", r"\\?\UNC\host\share\x.png", r"\\.\UNC\host\share\x.png",
                r"\??\UNC\host\share\x.png", r"/\host\share\x.png", "file://host/share/x.png",
@@ -4808,64 +4807,30 @@ class ImageSources(unittest.TestCase):
             with mock.patch.object(Path, "read_bytes", side_effect=PermissionError("denied")),                     self.assertRaisesRegex(ValueError, "could not be read from"):
                 Vision.load(str(f))
 
-    def test_a_url_is_read_up_to_the_cap(self):
-        import http.server
-        import serve.server as server
+    def test_image_urls_are_rejected_before_network_access(self):
+        from serve.server import Vision
+        with mock.patch("urllib.request.urlopen") as urlopen, mock.patch("socket.create_connection") as connect:
+            for source in ("http://127.0.0.1/image.png", "https://example.com/image.png"):
+                with self.subTest(source=source), self.assertRaisesRegex(ValueError, "not fetched"):
+                    Vision.load(source)
+        urlopen.assert_not_called()
+        connect.assert_not_called()
 
-        class Files(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                body = {"/small": b"x" * 100, "/big": b"x" * 5000}.get(urllib.parse.urlsplit(self.path).path)
-                if body is None:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                if "length" in self.path:                           # else the body ends when the connection does
-                    self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except OSError:                                     # the reader stopped at the cap
-                    pass
-
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Files)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{httpd.server_address[1]}"
-        try:
-            with mock.patch.object(server, "IMAGE_URL_MAX", 1000):
-                for q in ("", "?length"):
-                    with self.subTest(q=q):
-                        self.assertEqual(server.Vision.load(base + "/small" + q), b"x" * 100)
-                        with self.assertRaisesRegex(ValueError, "is over"):
-                            server.Vision.load(base + "/big" + q)
-                with self.assertRaisesRegex(ValueError, "could not be read: HTTP Error 404"):
-                    server.Vision.load(base + "/missing")
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-    def test_a_url_is_downloaded_outside_the_fifo(self):
-        import serve.server as server
+    def test_a_url_is_rejected_before_waiting_for_the_fifo(self):
         tok = ByteTokenizer()
         with tempfile.TemporaryDirectory() as d:
             vision = self.Vision(d)
             svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
                           vision=vision)
-            held = []
-
-            def download(url):
-                held.append(svc.fifo.locked())
-                return b"the picture"
-
-            msgs = [{"role": "user", "content": [{"type": "image", "source": "https://example.com/x.png"},
-                                                 {"type": "image", "source": "x.png"}]}]
-            with mock.patch.object(server.Vision, "download", side_effect=download):
-                svc.prepare(msgs, None, {})
-            self.assertEqual(held, [False])                         # not while every other request waits
-            self.assertEqual(vision.got, [b"the picture", "x.png"])
-            svc.embeddings.path.unlink(missing_ok=True)
+            msgs = [{"role": "user", "content": [{"type": "image", "source": "https://example.com/x.png"}]}]
+            with mock.patch.object(svc, "_turn", side_effect=AssertionError("waited for the GPU")), \
+                    mock.patch("urllib.request.urlopen") as urlopen, \
+                    mock.patch("socket.create_connection") as connect:
+                with self.assertRaisesRegex(ValueError, "does not fetch URLs"):
+                    svc.prepare(msgs, None, {})
+            self.assertEqual(vision.got, [])
+            urlopen.assert_not_called()
+            connect.assert_not_called()
 
     def test_a_page_of_another_site_cannot_name_a_file(self):
         tok = ByteTokenizer()

@@ -1,6 +1,12 @@
 """#879: a Stop that arrives while the engine reads the prompt (PP lines, no tokens yet) is sent at once, not after the
 first token."""
+import contextlib
+import json
 import os
+import socket
+import time
+from pathlib import Path
+from unittest import mock
 import queue
 import sys
 import threading
@@ -44,6 +50,62 @@ class ControlCancelTest(unittest.TestCase):
         for _ in eng._control(threading.Event(), lambda t: None):
             pass
         self.assertEqual(eng.sent, [])
+
+
+class LoadCancelTest(unittest.TestCase):
+    def setUp(self):
+        tok = server.ByteTokenizer()
+        self.svc = server.Service(server.MockEngine(tok, "ok"), tok,
+                                  server.ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+
+    def wait_for(self, predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(predicate())
+
+    def test_disconnected_generation_does_not_load_after_waiting(self):
+        httpd = server.serve(self.svc, port=0)
+        try:
+            for path, body in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/responses", {"input": "hi", "store": False})):
+                with self.subTest(path=path), mock.patch.object(self.svc, "loaded", return_value=False), \
+                        mock.patch.object(self.svc, "ensure_loaded") as load:
+                    self.svc.fifo.acquire()
+                    try:
+                        with socket.create_connection(httpd.server_address, timeout=3) as sock:
+                            data = json.dumps(body).encode()
+                            sock.sendall(f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: {len(data)}\r\n\r\n".encode() + data)
+                            self.wait_for(lambda: self.svc.status["queued"] == 1)
+                        self.wait_for(lambda: self.svc.status["queued"] == 0)
+                    finally:
+                        self.svc.fifo.release()
+                    load.assert_not_called()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_cancel_is_checked_after_acquiring_turn(self):
+        cancel = threading.Event()
+        @contextlib.contextmanager
+        def turn(event):
+            self.assertIs(event, cancel)
+            cancel.set()
+            yield
+        with mock.patch.object(self.svc, "loaded", return_value=False), \
+                mock.patch.object(self.svc, "_turn", turn), mock.patch.object(self.svc, "ensure_loaded") as load:
+            with self.assertRaises(server.ClientGone):
+                self.svc.load(cancel)
+            load.assert_not_called()
+        self.assertEqual(self.svc.status["queued"], 0)
+
+    def test_explicit_load_still_works_without_cancel(self):
+        with mock.patch.object(self.svc, "loaded", return_value=False), \
+                mock.patch.object(self.svc, "ensure_loaded") as load:
+            self.svc.load()
+            load.assert_called_once_with()
+        self.assertEqual(self.svc.status["queued"], 0)
 
 
 if __name__ == "__main__":

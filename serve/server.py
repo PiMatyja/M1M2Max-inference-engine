@@ -3441,9 +3441,11 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self, cancel: threading.Event | None = None):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
+        if cancel is not None and cancel.is_set():
+            raise ClientGone()
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             return
@@ -3453,7 +3455,9 @@ class Service:
             self.status["queued"] += 1
         counted = True
         try:
-            with self.fifo:
+            with self._turn(cancel):
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
                 with self.status_lock:
                     self.status["queued"] -= 1
                 counted = False
@@ -3463,6 +3467,8 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
                     self.ensure_loaded()
                 finally:
                     if trace is not None:
@@ -4997,6 +5003,73 @@ class BadBody(Exception):
         self.status = status
 
 
+def token_limit(value, field: str) -> int:
+    """A finite whole token limit, with 0 and -1 retaining the context defaults."""
+    if value is None:
+        return 0
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError()
+        n = int(value)
+        if isinstance(value, float) and value != n:
+            raise ValueError()
+        if n < -1:
+            raise ValueError()
+        return n
+    except (ValueError, OverflowError):
+        raise ValueError(f"{field}: must be a finite whole number (0 or -1 for the remaining context)") from None
+
+
+def http_read_timeout(phase: str) -> float:
+    """STRATA_HTTP_HEADER_S (30) and STRATA_HTTP_BODY_S (120) are positive budgets, capped at one hour."""
+    default = 30.0 if phase == "HEADER" else 120.0
+    try:
+        value = float(os.environ.get(f"STRATA_HTTP_{phase}_S", default))
+    except ValueError:
+        return default
+    return min(value, 3600.0) if math.isfinite(value) and value > 0 else default
+
+
+class DeadlineReader:
+    """Bound each complete read phase, including clients that keep sending single bytes."""
+
+    def __init__(self, reader, sock):
+        self.reader, self.sock, self.deadline = reader, sock, None
+
+    def __getattr__(self, name):
+        return getattr(self.reader, name)
+
+    def read1(self, size=-1):
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request read deadline exceeded")
+            self.sock.settimeout(left)
+        return self.reader.read1(size)
+
+    def read(self, size=-1):
+        parts, left = [], size
+        while left != 0:
+            part = self.read1(min(left, 1 << 20) if left > 0 else 1 << 20)
+            if not part:
+                break
+            parts.append(part)
+            if left > 0:
+                left -= len(part)
+        return b"".join(parts)
+
+    def readline(self, size=-1):
+        parts = bytearray()
+        while size < 0 or len(parts) < size:
+            part = self.read1(1)
+            if not part:
+                break
+            parts.extend(part)
+            if part == b"\n":
+                break
+        return bytes(parts)
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -5005,14 +5078,24 @@ def make_handler(svc: Service):
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
+        CONTROL_BODY_SECONDS = 2.0                          # the total budget for an unused control body
 
         def log_message(self, fmt, *args):
             pass
 
+        def setup(self):
+            super().setup()
+            self.rfile = DeadlineReader(self.rfile, self.connection)
+
         def handle_one_request(self):
             self.answer_started = False
-            super().handle_one_request()
-            self._drain_body()
+            self.rfile.deadline = time.monotonic() + http_read_timeout("HEADER")
+            try:
+                super().handle_one_request()
+                self._drain_body()
+            finally:
+                self.rfile.deadline = None
+                self.connection.settimeout(None)
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
@@ -5069,6 +5152,17 @@ def make_handler(svc: Service):
 
         def _body(self) -> bytes:
             self.body_read = True
+            self.rfile.deadline = time.monotonic() + http_read_timeout("BODY")
+            try:
+                return self._read_body()
+            except TimeoutError:
+                self.close_connection = True
+                raise BadBody(408, "request body read timed out") from None
+            finally:
+                self.rfile.deadline = None
+                self.connection.settimeout(None)
+
+        def _read_body(self) -> bytes:
             limit = body_limit()
             if self._chunked():
                 return self._read_chunked(limit)
@@ -5082,7 +5176,10 @@ def make_handler(svc: Service):
                 self.close_connection = True               # the body is not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
-            return self.rfile.read(length)
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise BadBody(400, "the request body ended early")
+            return body
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -5095,10 +5192,14 @@ def make_handler(svc: Service):
             if self.body_read or headers is None:
                 return
             if self._chunked():
+                self.rfile.deadline = time.monotonic() + self.DRAIN_SECONDS
                 try:
-                    self._read_chunked(body_limit(), keep=False, deadline=time.monotonic() + self.DRAIN_SECONDS)
+                    self._read_chunked(body_limit(), keep=False, deadline=self.rfile.deadline)
                 except (BadBody, OSError):
                     self.close_connection = True
+                finally:
+                    self.rfile.deadline = None
+                    self.connection.settimeout(None)
                 return
             try:
                 left = int(headers.get("Content-Length", 0))
@@ -5121,7 +5222,12 @@ def make_handler(svc: Service):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
             (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
             proxies that pass their own name on keep working."""
-            if not super().parse_request():
+            try:
+                parsed = super().parse_request()
+            finally:
+                self.rfile.deadline = None
+                self.connection.settimeout(None)
+            if not parsed:
                 return False
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
@@ -5639,11 +5745,21 @@ def make_handler(svc: Service):
             self._json(200, props)
 
         def _control_body(self) -> bool:
+            """Bound the whole control body read and clear its deadline before running the control operation."""
+            timeout = self.connection.gettimeout()
+            deadline = self.rfile.deadline
+            self.rfile.deadline = time.monotonic() + self.CONTROL_BODY_SECONDS
+            try:
+                return self._read_control_body()
+            finally:
+                self.rfile.deadline = deadline
+                self.connection.settimeout(timeout)
+
+        def _read_control_body(self) -> bool:
             """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
             if self._chunked():
                 self.body_read = True
                 try:
-                    self.connection.settimeout(2.0)
                     self._read_chunked(65536, keep=False)
                 except BadBody as e:
                     self._json(e.status, {"error": {"message": f"control request: {e}"}})
@@ -5660,14 +5776,11 @@ def make_handler(svc: Service):
             if not 0 <= length <= 65536:
                 self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
                 return False
-            timeout = self.connection.gettimeout()
             try:
-                self.connection.settimeout(2.0)
                 complete = len(self.rfile.read(length)) == length
             except OSError:
                 complete = False
             finally:
-                self.connection.settimeout(timeout)
                 self.body_read = True                    # nothing left for the drain to wait for (#594)
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
@@ -5822,8 +5935,13 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            for field in ("max_completion_tokens", "max_tokens"):
+                if field in req:
+                    token_limit(req[field], field)
+            max_req = max_new = token_limit(req.get("max_completion_tokens") or req.get("max_tokens"), "max_tokens")
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            svc.load(cancel)
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
@@ -5839,8 +5957,6 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -6017,7 +6133,8 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            token_limit(req.get("max_output_tokens"), "max_output_tokens")
+            svc.load(cancel)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6055,19 +6172,19 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = token_limit(req.get("max_tokens"), "max_tokens")
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            svc.load(cancel)
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)

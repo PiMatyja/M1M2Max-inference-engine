@@ -6,6 +6,9 @@
 import http.client
 import json
 import os
+import socket
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -39,6 +42,113 @@ class Hardening(unittest.TestCase):
             return r.status, json.loads(r.read() or b"{}")
         finally:
             c.close()
+
+    def test_token_limits_are_finite_whole_numbers(self):
+        chat = {"messages": [{"role": "user", "content": "hi"}]}
+        for path, base, field in (
+                ("/v1/chat/completions", chat, "max_tokens"),
+                ("/v1/chat/completions", chat, "max_completion_tokens"),
+                ("/v1/messages", chat, "max_tokens"),
+                ("/v1/responses", {"input": "hi", "store": False}, "max_output_tokens")):
+            for value in (float("inf"), float("-inf"), float("nan"), 1.5, True, -2, [], {}):
+                with self.subTest(path=path, field=field, value=value), mock.patch("builtins.print"):
+                    code, out = self.post(path, {**base, field: value})
+                    self.assertEqual(code, 400, out)
+                    self.assertIn(field, json.dumps(out))
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            code, out = self.post(path, b'{"messages":[{"role":"user","content":"hi"}],"max_tokens":1e309}')
+            self.assertEqual(code, 400, out)
+            for value in (None, 0, -1, 8, 8.0, "8"):
+                with self.subTest(path=path, value=value):
+                    code, out = self.post(path, {**chat, "max_tokens": value})
+                    self.assertEqual(code, 200, out)
+        for value in (0, -1):
+            code, out = self.post("/v1/responses", {"input": "hi", "max_output_tokens": value})
+            self.assertEqual(code, 400, out)  # Responses retains its positive-integer contract.
+
+    def raw_request(self, data):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=3) as sock:
+            sock.sendall(data)
+            response = bytearray()
+            while piece := sock.recv(65536):
+                response.extend(piece)
+            return bytes(response)
+
+    def test_incomplete_headers_and_request_line_expire(self):
+        with mock.patch.dict(os.environ, {"STRATA_HTTP_HEADER_S": "0.15"}):
+            for data in (b"GET /hea", b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nX-Slow: "):
+                start = time.monotonic()
+                self.assertEqual(self.raw_request(data), b"")
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_incomplete_bodies_are_408_api_errors(self):
+        with mock.patch.dict(os.environ, {"STRATA_HTTP_BODY_S": "0.15"}):
+            for framing, body in ((b"Content-Length: 50", b"{"),
+                                  (b"Transfer-Encoding: chunked", b"20\r\n{"),
+                                  (b"Transfer-Encoding: chunked", b"0\r\nX-Trailer: ")):
+                raw = self.raw_request(b"POST /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1\r\n" +
+                                       framing + b"\r\n\r\n" + body)
+                head, content = raw.split(b"\r\n\r\n", 1)
+                self.assertIn(b"408", head)
+                self.assertEqual(json.loads(content)["error"]["type"], "invalid_request_error")
+                self.assertIn("timed out", json.loads(content)["error"]["message"])
+
+    def test_trickling_bytes_do_not_extend_the_body_budget(self):
+        with mock.patch.dict(os.environ, {"STRATA_HTTP_BODY_S": "0.2"}):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=3) as sock:
+                sock.sendall(b"POST /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n")
+                def trickle():
+                    for _ in range(30):
+                        try:
+                            sock.sendall(b" ")
+                        except OSError:
+                            return
+                        time.sleep(0.04)
+                thread = threading.Thread(target=trickle)
+                start = time.monotonic()
+                thread.start()
+                try:
+                    response = http.client.HTTPResponse(sock)
+                    response.begin()
+                    self.assertEqual(response.status, 408)
+                    self.assertIn("timed out", json.loads(response.read())["error"]["message"])
+                    self.assertLess(time.monotonic() - start, 1)
+                finally:
+                    sock.close()
+                    thread.join(2)
+
+    def test_read_timeout_configuration_is_always_bounded(self):
+        from serve.server import http_read_timeout
+        for value in ("0", "-1", "nan", "inf", "junk"):
+            with mock.patch.dict(os.environ, {"STRATA_HTTP_HEADER_S": value, "STRATA_HTTP_BODY_S": value}):
+                self.assertEqual(http_read_timeout("HEADER"), 30)
+                self.assertEqual(http_read_timeout("BODY"), 120)
+        with mock.patch.dict(os.environ, {"STRATA_HTTP_HEADER_S": "10000", "STRATA_HTTP_BODY_S": "0.5"}):
+            self.assertEqual(http_read_timeout("HEADER"), 3600)
+            self.assertEqual(http_read_timeout("BODY"), 0.5)
+
+    def test_read_deadlines_do_not_limit_queue_or_generation(self):
+        with mock.patch.dict(os.environ, {"STRATA_HTTP_HEADER_S": "0.1", "STRATA_HTTP_BODY_S": "0.1"}):
+            for stream in (False, True):
+                result = []
+                self.svc.fifo.acquire()
+                def request():
+                    result.append(self.raw_request(
+                        b"POST /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: " +
+                        str(len(body)).encode() + b"\r\n\r\n" + body))
+                body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                                   "max_tokens": 8, "stream": stream}).encode()
+                with mock.patch.object(self.svc.engine, "delay", 0.04):
+                    thread = threading.Thread(target=request)
+                    thread.start()
+                    try:
+                        time.sleep(0.3)
+                    finally:
+                        self.svc.fifo.release()
+                    thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertIn(b"200 OK", result[0])
+                self.assertIn(b"[DONE]" if stream else b"chat.completion", result[0])
 
     def test_wrong_shapes_are_400(self):
         for path, body in (("/v1/chat/completions", {"messages": 5}),
