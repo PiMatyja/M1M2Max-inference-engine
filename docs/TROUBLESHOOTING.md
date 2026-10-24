@@ -19,8 +19,8 @@ It refuses on purpose: running the engine beside a repack froze a Mac. Wait for 
 `STRATA_METAL_IGNORE_REPACK=1` starts it anyway, if you insist.
 
 **The pack tools fail with `No module named numpy`.**
-`requirements-mac.txt` does not install numpy, and `iq_pack.py`, `mtp_pack.py` and llama.cpp's `gguf-py` import it.
-Add numpy to the venv, then pack again.
+The venv is from before numpy was pinned. Delete `.venv/requirements-mac.sha256`, run `scripts/python-env.sh`
+again, then pack again.
 
 **`port 8000 is already in use`.**
 Strata is already running (check `curl -s 127.0.0.1:8000/v1/models`), or another program uses the port: start with

@@ -23,7 +23,7 @@ repository root.
 - No prebuilt executables. Upstream Strata's setup downloads a ready-made engine from GitHub releases and a
   ready-made Python; its updaters pull new code. None of that is in this repository: the engine is compiled here
   from source that was read first. The setup scripts, the updaters and the release downloads are gone.
-- Python packages only as source archives, pinned by SHA-256 (`--no-binary :all: --require-hashes`).
+- Python packages only as source archives, pinned by SHA-256 and verified before any build runs.
 - One engine on the GPU at a time (the model is 47 GB resident).
 - The server listens on 127.0.0.1 only, whatever a flag or config says. MCP is off. Image URLs are never
   fetched. The browser is not opened for you.
@@ -64,7 +64,8 @@ repository root.
 2. **The model:** `scripts/download-model.sh`. It downloads the two IQ3_XXS shards of ISTA-DASLab's
    `Qwen3.8-Flash-Next-GSQ-RCO-GGUF` at revision `ed59f92082b1e93c0e96d60a8b11aab089b52f09` into
    `$STRATA_MODELS/IQ3_XXS/` (resumable), checks each SHA-256 and writes a `<shard>.sha256-ok` marker next to it
-   so a second run does not hash the 76 GB again, then fetches the MTP draft layer (step 3). By hand:
+   so a second run does not hash the 76 GB again (delete the marker to force a re-check), then fetches the MTP
+   draft layer (step 3). By hand:
 
    ```bash
    R=https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_XXS
@@ -120,32 +121,18 @@ make -C build-metal -j10 strata
 The engine is `build-metal/strata`. GPU kernels are compiled at run time from this tree's `.metal` files, so the
 tree must stay where it was built.
 
-**Python:** `scripts/python-env.sh`. It makes `.venv` from Homebrew's python 3.14 and installs
-`requirements-mac.txt`: setuptools, flit-core, markupsafe, jinja2, pyyaml and regex, each from its source archive,
-each pinned by SHA-256. By hand:
+**Python:** `scripts/python-env.sh`. It makes `.venv` from Homebrew's python 3.14 (3.12 and 3.13 also work) and
+installs `requirements-mac.txt`: the server's packages (markupsafe, jinja2, pyyaml, regex), numpy for the pack
+tools of step 5, and the build backends that compile them (setuptools, flit-core, wheel, packaging,
+pyproject-metadata, meson, ninja, meson-python, cython). Every line is one version and its PyPI source-archive
+SHA-256. The script downloads each archive from PyPI, checks the hash, unpacks it, deletes any `.exe`, `.dll`,
+`.dylib` or `.whl` inside, and installs it with `--no-deps --no-build-isolation --no-index`, in the file's order, so
+pip never fetches anything by itself. Ninja is compiled from its own sources; numpy builds against macOS's
+Accelerate framework. The whole step takes a few minutes because numpy compiles. A second run exits at once when
+`.venv` already matches the file (it keeps a hash of it in `.venv/requirements-mac.sha256`).
 
-```bash
-$(brew --prefix)/bin/python3.14 -m venv .venv
-.venv/bin/pip download --no-binary :all: --no-deps --require-hashes -r requirements-mac.txt -d .venv/sdists
-# setuptools first: unpack it, delete its Windows launchers, install the folder
-mkdir .venv/sdists/setuptools-src
-tar -xzf .venv/sdists/setuptools-*.tar.gz -C .venv/sdists/setuptools-src --strip-components 1
-find .venv/sdists/setuptools-src -type f \( -name '*.exe' -o -name '*.dll' \) -delete
-.venv/bin/pip install --no-deps --no-build-isolation --no-index .venv/sdists/setuptools-src
-# then the rest, one archive at a time, in the file's order
-for n in flit_core markupsafe jinja2 pyyaml regex; do
-  .venv/bin/pip install --no-deps --no-build-isolation --no-index .venv/sdists/$n-*.tar.gz
-done
-```
-
-One `pip install -r` line does not work here: `--no-build-isolation` needs the build backend already in the venv,
-and setuptools must be installed before markupsafe, so the script downloads every archive first (hash-checked)
-and installs them one by one in the file's order. The versions are jinja2 3.1.6, markupsafe 3.0.3, pyyaml 6.0.3,
-regex 2026.9.10; setuptools and flit-core are current releases. The hashes are in `requirements-mac.txt`.
-
-**numpy:** the pack tools of step 5 (`iq_pack.py`, `mtp_pack.py` and llama.cpp's `gguf-py`) import numpy, which
-is not in `requirements-mac.txt`. Add it to the venv before packing, the same way (a source archive, pinned by
-its hash), or from a wheel if you accept that.
+There is no one-line `pip install -r` equivalent: with build isolation off, each backend must be installed before
+the packages that need it, which is what the order in the file and the script give you.
 
 ## 5. Model files Strata needs
 
@@ -189,6 +176,11 @@ sampling defaults (`temperature` 1.0, `top_p` 0.95, `top_k` 20), and the bookkee
 
 Model id: `qwen3.8-flash-next-iq3_xxs`, OpenAI-compatible on `http://127.0.0.1:8000/v1`, Anthropic-compatible on
 `/v1/messages`, the chat page on `http://127.0.0.1:8000/`. How to use the API: [DETAILS.md](DETAILS.md).
+
+Incomplete HTTP requests have total read budgets: 30 seconds for headers and 120 seconds for a generation
+body. `STRATA_HTTP_HEADER_S` and `STRATA_HTTP_BODY_S` accept positive seconds, capped at one hour; invalid values
+use the defaults. The unused body of `/load` and `/unload` has a separate two-second budget. These deadlines
+end before queueing, model loading or inference; they do not limit how long a valid generation may run.
 
 What each setting buys:
 - `--spec 8 --mtp-max-t 2`: MTP drafts 2 words (3+ was 13-28% slower); prompt lookup up to 8 for edits.

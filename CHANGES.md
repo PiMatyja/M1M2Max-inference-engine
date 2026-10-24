@@ -89,3 +89,32 @@ The server's "reading X of Y" prompt progress is now per request. A heartbeat ca
 engine's progress line changed since this pass started, so a request that is queued, inside a tool call or
 waiting behind another request no longer shows that other request's numbers. Covered by new cases in the server
 tests. Files: `serve/server.py`, `serve/test_server.py`.
+
+## 9. Review pass after the first commit
+
+A second review added checks around the existing code without touching kernels, precision or sampling.
+
+The Metal loader (`validate_window_tensors` in `metal/src/gguf_lite.cpp`, called from `Window::init`) checks the
+name, shape and type of every tensor the decode window reads before any Metal context exists, so a wrong or
+truncated GGUF is refused with the tensor's name instead of crashing later; the GGUF reader also rejects empty
+dimensions and rows that are not whole quant blocks. The expected shapes were checked against the real IQ3_XXS
+file's header. Covered by `metal/tests/gguf_lite_test.cpp`.
+
+The SSD conversation tier (`src/core/conversation_ssd.cpp`) now counts pinned checkpoints and the token buffers a
+restore keeps in its RAM estimate, and refuses a file whose checkpoint index changed since it was indexed. The
+corruption test flips a byte in the file it actually read. Covered by `metal/tests/conversation_ssd_test.cpp`.
+
+The server (`serve/server.py`) rejects token limits that are not whole finite numbers, checks for a gone client
+before starting an unloaded engine, and bounds how long an incomplete request may take to arrive (30 s for the
+headers, 120 s for a body, 2 s for an unused control body; `STRATA_HTTP_HEADER_S` and `STRATA_HTTP_BODY_S` change
+them). Generation itself has no deadline. Covered by `serve/test_control_cancel.py`,
+`serve/test_control_read_deadline.py` and `serve/test_request_hardening.py`.
+
+`tools/mtp_pack.py` writes the MTP pack to a temporary file and renames it when complete, with a receipt that
+records the source manifest and the output hash; `--reuse` keeps a pack whose receipt still matches, so an
+interrupted pack is never mistaken for a finished one. `scripts/prepare-model.sh` uses it.
+
+`requirements-mac.txt` now pins numpy and its build chain (meson, meson-python, ninja, cython, wheel, packaging,
+pyproject-metadata) as hashed source archives, and `scripts/python-env.sh` downloads each archive from PyPI,
+checks its hash, unpacks it, strips any binaries and installs it without build isolation, so the pack step works
+from the same venv as the server. `scripts/check.sh` no longer nests quotes inside an f-string.

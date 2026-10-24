@@ -44,15 +44,15 @@ Each step is one script. The full walk-through, with what every command does, is
    into `third_party/`. Both stay out of git.
 3. Build: `scripts/build.sh` runs cmake on `metal/` and makes the `strata` binary in `build-metal/`. The GPU
    kernels are compiled at run time from this tree's `.metal` files, so keep the tree where it was built.
-4. Python: `scripts/python-env.sh` makes `.venv` from Homebrew python 3.14 and installs the six packages in
-   `requirements-mac.txt` (setuptools, flit-core, markupsafe, jinja2, pyyaml, regex) from their source archives,
-   each pinned by its sdist SHA-256.
+4. Python: `scripts/python-env.sh` makes `.venv` from Homebrew python 3.14 and installs the server, pack tools'
+   dependencies (including numpy) and their build backends from source archives in `requirements-mac.txt`.
+   Each archive is pinned by its SHA-256. Build isolation and automatic dependency installation are disabled.
 5. Download the model: `scripts/download-model.sh` fetches the two IQ3_XXS shards of ISTA-DASLab's
    Qwen3.8-Flash-Next-GSQ-RCO-GGUF at the pinned revision into `~/strata-models/IQ3_XXS/` and checks their
    SHA-256, then fetches and verifies the MTP draft layer.
 6. Prepare the model: `scripts/prepare-model.sh` builds the expert pack (`tools/iq_pack.py`) and the MTP pack
-   (`tools/mtp_pack.py`). This step also needs numpy in the venv, which is not pinned yet; docs/GUIDE.md says how
-   to add it. The pack is tied to the exact GGUF: rebuild it if the model file changes.
+   (`tools/mtp_pack.py`). The Python setup includes numpy. The pack is tied to the exact GGUF: rebuild it if the
+   model file changes.
 7. Make the run config: `scripts/make-config.py` writes `strata-cached.json` with the tuned settings.
 8. Run: `scripts/start.sh` starts the server on port 8000. Model id: `qwen3.8-flash-next-iq3_xxs`.
 9. Verify: `scripts/check.sh` asks the server whether the model is `loaded` (the same as
@@ -75,8 +75,8 @@ setting, and what was measured: docs/TUNING.md.
 - No prebuilt executables. Upstream's installer downloads a ready-made engine and a ready-made Python; its
   updaters pull new code. None of that is here: the installer, the updaters and the PC build files are removed,
   and the engine is compiled from source that was read first.
-- Python packages only as source archives, pinned by SHA-256 (`--no-binary :all: --require-hashes`,
-  `requirements-mac.txt`).
+- Python packages only as source archives, pinned by SHA-256 in `requirements-mac.txt` and verified before
+  any build runs. No automatic build-dependency downloads.
 - The server listens on 127.0.0.1 only, never fetches a URL and starts no MCP servers. See SECURITY.md.
 - One engine on the GPU at a time: the model is 47 GB resident.
 

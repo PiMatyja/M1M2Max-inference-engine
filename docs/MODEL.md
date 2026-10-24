@@ -90,8 +90,8 @@ form the engine reads them:
 experts from the GGUF at those offsets. If the model file changes (another revision, another download), rebuild
 the pack.
 
-The pack tools and llama.cpp's `gguf-py` import numpy, which `requirements-mac.txt` does not install. Add it to
-the venv before packing.
+The pack tools and llama.cpp's `gguf-py` import numpy; `scripts/python-env.sh` installs it from a pinned source
+archive.
 
 ## Memory
 

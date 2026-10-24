@@ -43,10 +43,9 @@ Run from the repository root, in this order. Each script's manual commands are i
 1. The GPU limit: the user runs `scripts/gpu-limit.sh` (sudo). It resets on every reboot.
 2. `scripts/fetch-deps.sh` (metal-cpp headers and llama.cpp at the pinned commit, both checked).
 3. `scripts/build.sh` (the engine, `build-metal/strata`).
-4. `scripts/python-env.sh` (`.venv` with the pinned packages).
+4. `scripts/python-env.sh` (`.venv` with the pinned packages, numpy included; a few minutes).
 5. `scripts/download-model.sh` (both shards, hash-checked, then the MTP tensors, hash-checked).
-6. Add numpy to `.venv` (the pack tools import it; it is not in `requirements-mac.txt`), then
-   `scripts/prepare-model.sh` (the expert pack and the MTP draft layer).
+6. `scripts/prepare-model.sh` (the expert pack and the MTP draft layer; numpy comes from step 4).
 7. `scripts/make-config.py` (writes `strata-cached.json`; `--context`, `--port`, `--out`, `--models`).
 8. `scripts/start.sh` (the server in the foreground; Ctrl-C stops it). Start it in its own terminal or in the
    background, so it does not block your shell.
