@@ -578,6 +578,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         return false;
     }
     if (!f_.open(shard1, err)) return false;
+    if (!gguf::validate_window_tensors(f_, ss.ple.ready() && f_.find("blk.1.ple_key.weight"), err)) return false;
     cx_ = std::make_unique<mtl::Context>();
     m12_ = !cx_->has_family_apple(9);
     g_ctab_default = !m12_;

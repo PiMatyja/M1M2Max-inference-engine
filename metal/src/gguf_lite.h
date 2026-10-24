@@ -34,4 +34,7 @@ struct File {
     ~File();
 };
 
+// Checks the fixed decode window's required weights without constructing a Metal context.
+bool validate_window_tensors(const File& file, bool ple, std::string& err);
+
 }  // namespace gguf

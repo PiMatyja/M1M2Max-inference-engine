@@ -62,9 +62,98 @@ G valid() {
     return g.pad(64).data(64 + 34);
 }
 
+void window_tensors() {
+    gguf::File f;
+    auto add = [&](const std::string& name, std::vector<uint64_t> shape, int type = ref::BF16) {
+        gguf::Tensor t;
+        t.name = name; t.shape = shape; t.type = type;
+        f.tensors[name] = t;
+    };
+    auto norm = [&](const std::string& name, uint64_t n) { add(name, {n}, ref::F32); };
+    auto hc = [&](const std::string& p, bool final) {
+        norm(p + "_norm.weight", 10240);
+        add(p + "_down.weight", {10240, 320});
+        add(p + "_up.weight", {320, 10240});
+        if (!final) add(p + "_inject.weight", {10240, 4});
+    };
+    add("output.weight", {2560, 151936});
+    add("token_embd.weight", {2560, 151936});
+    hc("output_hc", true);
+    for (int l = 0; l < 48; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        hc(b + "hc_attn", false); hc(b + "hc_ffn", false);
+        add(b + "ffn_gate_inp.weight", {2560, 512});
+        add(b + "ffn_gate_shexp.weight", {2560, 640});
+        add(b + "ffn_up_shexp.weight", {2560, 640});
+        add(b + "ffn_down_shexp.weight", {640, 2560});
+        add(b + "ffn_gate_inp_shexp.weight", {2560});
+        add(b + "ffn_gate_exps.weight", {2560, 640, 512}, ref::IQ3_XXS);
+        add(b + "ffn_up_exps.weight", {2560, 640, 512}, ref::IQ3_XXS);
+        add(b + "ffn_down_exps.weight", {640, 2560, 512}, ref::Q2_0);
+        if (l % 4 != 3) {
+            add(b + "attn_qkv.weight", {2560, 10240}); add(b + "attn_gate.weight", {2560, 6144});
+            add(b + "ssm_alpha.weight", {2560, 48}); add(b + "ssm_beta.weight", {2560, 48});
+            add(b + "ssm_out.weight", {6144, 2560}); add(b + "ssm_conv1d.weight", {4, 10240}, ref::F32);
+            norm(b + "ssm_a", 48); norm(b + "ssm_dt.bias", 48); norm(b + "ssm_norm.weight", 128);
+        } else {
+            add(b + "attn_q.weight", {2560, 12288}); add(b + "attn_k.weight", {2560, 512});
+            add(b + "attn_v.weight", {2560, 512}); add(b + "attn_output.weight", {6144, 2560});
+            add(b + "indexer.q_proj.weight", {2560, 512}); add(b + "indexer.k_proj.weight", {2560, 128});
+            norm(b + "attn_q_norm.weight", 256); norm(b + "attn_k_norm.weight", 256);
+            norm(b + "indexer.q_norm.weight", 128); norm(b + "indexer.k_norm.weight", 128);
+        }
+    }
+    add("blk.1.ple_key.weight", {2560, 10240}); add("blk.1.ple_value.weight", {2560, 2560});
+    add("blk.1.ple_conv1d.weight", {4, 10240}, ref::F16);
+    norm("blk.1.ple_norm_key.weight", 10240); norm("blk.1.ple_norm_query.weight", 10240);
+    norm("blk.1.ple_norm_conv.weight", 10240);
+    std::string err;
+    const bool valid = gguf::validate_window_tensors(f, true, err);
+    std::printf("%s window: complete geometry with rank-one norms %s\n", valid ? "ok  " : "FAIL", err.c_str());
+    failures += !valid;
+    // Every required tensor is checked before Window creates a GPU context.
+    int bad = 0;
+    for (auto& kv : f.tensors) {
+        auto saved = kv.second;
+        kv.second.shape = {1};
+        if (gguf::validate_window_tensors(f, true, err) || err.find(kv.first) == std::string::npos) ++bad;
+        kv.second = saved;
+    }
+    for (const char* name : {"output.weight", "token_embd.weight", "blk.0.attn_qkv.weight", "blk.3.indexer.q_norm.weight"}) {
+        const auto saved = f.tensors.at(name);
+        f.tensors.erase(name);
+        if (gguf::validate_window_tensors(f, true, err) || err.find(name) == std::string::npos) ++bad;
+        f.tensors[name] = saved;
+    }
+    for (const char* name : {"blk.0.ssm_conv1d.weight", "output_hc_norm.weight", "blk.1.ple_conv1d.weight"}) {
+        const int saved = f.tensors.at(name).type;
+        f.tensors.at(name).type = ref::Q8_0;
+        if (gguf::validate_window_tensors(f, true, err)) ++bad;
+        f.tensors.at(name).type = saved;
+    }
+    for (const char* name : {"output.weight", "blk.0.ffn_gate_exps.weight", "blk.0.attn_qkv.weight"}) {
+        const int saved = f.tensors.at(name).type;
+        f.tensors.at(name).type = ref::F16;
+        if (gguf::validate_window_tensors(f, true, err)) ++bad;
+        f.tensors.at(name).type = saved;
+    }
+    f.tensors.at("blk.0.hc_attn_down.weight").type = ref::Q8_0;
+    if (gguf::validate_window_tensors(f, true, err)) ++bad;
+    f.tensors.at("blk.0.hc_attn_up.weight").type = ref::Q8_0;
+    f.tensors.at("blk.0.hc_attn_inject.weight").type = ref::F32;
+    if (!gguf::validate_window_tensors(f, true, err)) ++bad;
+    f.tensors.at("output.weight").shape = {};
+    if (gguf::validate_window_tensors(f, true, err)) ++bad;
+    f.tensors.at("output.weight").shape = {2560, 248321};
+    if (gguf::validate_window_tensors(f, true, err)) ++bad;
+    std::printf("%s window: malformed required tensor shapes, types and omissions\n", bad ? "FAIL" : "ok  ");
+    failures += bad;
+}
+
 }  // namespace
 
 int main() {
+    window_tensors();
     const char* t = std::getenv("TMPDIR");
     std::string base = std::string(t && *t ? t : "/tmp") + "/gguf_lite_test.XXXXXX";
     if (!mkdtemp(base.data())) { std::perror("mkdtemp"); return 1; }
@@ -105,6 +194,10 @@ int main() {
     refused(G().head(0, 1).s("k").v<uint32_t>(9).v<uint32_t>(9).v<uint64_t>(1).data(64).b, "nested array", "truncated");
     refused(G().head(0, 1).s("k").v<uint32_t>(77).data(64).b, "unknown value type", "truncated");
     refused(G().head(1, 0).tensor("a", {1, 1, 1, 1, 1}, ref::F32, 0).pad(32).data(32).b, "nd 5", "truncated");
+    refused(G().head(1, 0).tensor("a", {}, ref::F32, 0).pad(32).data(32).b, "rank zero", "truncated");
+    refused(G().head(1, 0).tensor("a", {0, 8}, ref::F32, 0).pad(32).data(32).b, "zero dimension", "dimension");
+    refused(G().head(1, 0).tensor("a", {33}, ref::Q8_0, 0).pad(32).data(68).b, "partial quant block", "row block");
+    refused(G().head(1, 0).tensor("a", {16, 2}, ref::Q8_0, 0).pad(32).data(34).b, "non-block-aligned row", "row block");
     refused(G().head(~0ull >> 1, 0).data(64).b, "huge tensor count", "truncated");
     for (uint32_t al : {0u, 48u, 131072u}) {
         const std::string what = "general.alignment " + std::to_string(al);
