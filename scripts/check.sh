@@ -14,6 +14,7 @@ if not data:
 for m in data:
     status = (m.get("status") or {}).get("value", "?")
     ctx = (m.get("meta") or {}).get("n_ctx")
-    print(f"{m.get(\"id\")}: {status}" + (f", context {ctx}" if ctx else ""))
+    model_id = m.get("id")
+    print(f"{model_id}: {status}" + (f", context {ctx}" if ctx else ""))
 sys.exit(0 if any((m.get("status") or {}).get("value") == "loaded" for m in data) else 1)
 '

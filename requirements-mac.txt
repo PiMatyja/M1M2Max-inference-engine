@@ -1,16 +1,24 @@
-# Python packages for the server and the pack tools, built from source archives only (no wheels).
-# Every line is pinned to one version and its sdist SHA-256 from PyPI, so pip refuses anything else.
-# scripts/python-env.sh installs them into a venv made from Homebrew python 3.14: it downloads every archive with
-#   .venv/bin/pip download --no-binary :all: --no-deps --require-hashes -r requirements-mac.txt -d .venv/sdists
-# then installs them one at a time, in the order below, with --no-deps --no-build-isolation --no-index.
-# --no-build-isolation means the build backends (setuptools, flit-core) must already be in the venv, so they come first.
-# pip itself must be new enough to know Python 3.14 (pip 25.2 or newer; Homebrew python 3.14 ships one).
+# Source archives only, each pinned to its PyPI sdist SHA-256.
+# scripts/python-env.sh verifies all sources before building, then installs in this order.
+# No pip download metadata hooks, build isolation, dependency resolution or wheel downloads.
+# Python 3.12-3.14 on macOS with Apple clang; NumPy uses the system Accelerate framework.
+# Ninja is bootstrapped from bundled C++ sources, not installed with its Python backend.
 
 # Build backend for markupsafe, pyyaml and regex.
 setuptools==84.0.0 --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
 
-# Build backend for jinja2 and markupsafe (PEP 517 flit).
-flit-core==4.1.0 --hash=sha256:62e12b63ead8335b37f59fabb977c7167fe476dafb5e41785dfa8c9aff843bc6
+# Jinja2 and wheel require flit-core < 4; packaging requires >= 3.12.
+flit-core==3.12.0 --hash=sha256:18f63100d6f94385c6ed57a72073443e1a71a4acb4339491615d0f16d6ff01b2
+
+# Source build requirements for Meson, meson-python, PyYAML and NumPy.
+wheel==0.45.1 --hash=sha256:661e1abd9198507b1409a20c02106d9670b2576e916d58f520316666abca6729
+packaging==26.0 --hash=sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4
+pyproject-metadata==0.11.0 --hash=sha256:c72fa49418bb7c5a10f25e050c418009898d1c051721d19f98a6fb6da59a66cf
+meson==1.10.2 --hash=sha256:7890287d911dd4ee1ebd0efb61ed0321bfcd87c725df923a837cf90c6508f96b
+ninja==1.13.0 --hash=sha256:4a40ce995ded54d9dc24f8ea37ff3bf62ad192b547f6c7126e7e25045e76f978
+meson-python==0.19.0 --hash=sha256:9959d198aa69b57fcfd354a34518c6f795b781a73ed0656f4d01660160cc2553
+cython==3.2.4 --hash=sha256:84226ecd313b233da27dc2eb3601b4f222b8209c3a7216d8733b031da1dc64e6
+numpy==2.4.3 --hash=sha256:483a201202b73495f00dbc83796c6ae63137a9bdade074f7648b3e32613412dd
 
 # Escaping used by jinja2 when it renders the chat template.
 markupsafe==3.0.3 --hash=sha256:722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698
