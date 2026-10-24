@@ -1,6 +1,6 @@
 # Strata for M1 Max / M2 Max
 
-One Metal engine, one model. This repository holds Strata's inference engine for Apple Silicon, built from
+This repository holds Strata's inference engine for Apple Silicon, built from
 audited source and tuned for the M1 Max and M2 Max with 64 GB (Apple GPU families 7 and 8: one target). It
 serves Qwen3.8-Flash-Next at IQ3_XXS as an OpenAI-compatible API on 127.0.0.1:8000.
 
@@ -9,7 +9,7 @@ binaries. Everything runs offline once the downloads are done.
 
 ## Results
 
-Measured on an M2 Max 64 GB (2026-10-15). A token is about three quarters of a word.
+Measured on an M2 Max 64 GB
 
 | | Original MLX 3.3-bit | Stock Strata | This setup |
 |---|---|---|---|
@@ -20,8 +20,7 @@ Measured on an M2 Max 64 GB (2026-10-15). A token is about three quarters of a w
 | SQL test (5 tries) | 2/5 | 0/3 | 5/5 |
 | Next-word match vs the original | 78.8% | 78.6% | 78.6% |
 
-Greedy answers are bit-identical to stock Strata for a fixed drafting setup: the tuning moves work around, it
-does not change the math.
+Greedy answers are bit-identical to stock Strata for a fixed drafting setup.
 
 ## What you need
 
