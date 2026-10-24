@@ -23,8 +23,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -136,57 +138,100 @@ def main() -> int:
     ap.add_argument("--src", required=True, help="directory written by tools/mtp_fetch.py fetch")
     ap.add_argument("--experts", choices=sorted(QUANT), default="q2_0")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--reuse", action="store_true", help="reuse only a pack with a matching hash receipt")
     ap.add_argument("--check-experts", type=int, default=8, help="experts per tensor used for the error report")
     a = ap.parse_args()
     src = Path(a.src)
     manifest = json.loads((src / "mtp-manifest.json").read_text())
+    out = Path(a.out)
+    source_hash = hashlib.sha256((src / "mtp-manifest.json").read_bytes()).hexdigest()
+    receipt = Path(str(out) + ".report.json")
+    if a.reuse and reusable_pack(out, receipt, source_hash, a.experts):
+        print(f"mtp: verified existing pack {out}")
+        return 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".mtp-pack-", dir=out.parent) as temporary:
+        staged = Path(temporary) / out.name
+        a.out = str(staged)
+        report = write_pack(a, src, manifest)
+        report.update({"source_manifest_sha256": source_hash, "expert_format": a.experts,
+                       "output_sha256": file_sha256(staged), "output_size": staged.stat().st_size})
+        staged_receipt = Path(str(staged) + ".report.json")
+        staged_receipt.write_text(json.dumps(report, indent=1))
+        # Publish the closed pack first; a crash before the receipt forces a safe rebuild.
+        os.replace(staged, out)
+        os.replace(staged_receipt, receipt)
+    print(f"wrote {out}: {report['total_bytes'] / 1e9:.3f} GB of tensor data")
+    return 0
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def reusable_pack(out: Path, receipt: Path, source_hash: str, experts: str) -> bool:
+    try:
+        report = json.loads(receipt.read_text())
+        return (report["source_manifest_sha256"] == source_hash
+                and report["expert_format"] == experts
+                and report["output_size"] == out.stat().st_size
+                and report["output_sha256"] == file_sha256(out))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def write_pack(a, src: Path, manifest: list) -> dict:
     fn, qtype, block, block_bytes = QUANT[a.experts]
     w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
-    w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
-    w.add_string("strata.mtp.source_sha256", hashlib.sha256(
-        json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
-    w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
-    report = []
-    for t in sorted(manifest, key=lambda t: t["name"]):
-        name, shape = t["name"], t["shape"]
-        t0 = time.time()
-        if name in EXPERT_TENSORS:
-            # Streamed one expert at a time from a read-only view: the fused gate_up tensor alone is 6.7 GB as
-            # float32, so it is never materialized whole.
-            raw = np.memmap(src / t["file"], dtype="<u2", mode="r", shape=tuple(shape))
-            x = _Experts(raw)
-            if shape[-1] % block:
-                raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {block}")
-            parts = [fn(x[e]) for e in range(shape[0])]            # one expert at a time bounds memory
-            blob = np.concatenate(parts)
-            errs = []
-            for e in range(min(a.check_experts, shape[0])):
-                ref = x[e].reshape(-1)
-                got = dequant(a.experts, parts[e], ref.size)
-                errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
-            # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
-            w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
-            report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
-                           "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),
-                           "seconds": round(time.time() - t0, 1)})
-        elif len(shape) == 1:
-            x = load_bf16(src / t["file"], shape)
-            w.add_tensor(name, x.astype(np.float32))
-            report.append({"tensor": name, "format": "F32", "bytes": x.size * 4})
-        else:
-            bf = np.fromfile(src / t["file"], dtype="<u2").reshape(shape)
-            w.add_tensor(name, bf, raw_dtype=gguf.GGMLQuantizationType.BF16)
-            report.append({"tensor": name, "format": "BF16", "bytes": bf.size * 2})
-        print(f"{name}: {report[-1]['format']} {report[-1]['bytes'] / 1e6:.1f} MB", flush=True)
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
+    try:
+        w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
+        w.add_string("strata.mtp.source_sha256", hashlib.sha256(
+            json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
+        w.add_string("strata.mtp.expert_format", a.experts)
+        w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+        report = []
+        for t in sorted(manifest, key=lambda t: t["name"]):
+            name, shape = t["name"], t["shape"]
+            t0 = time.time()
+            if name in EXPERT_TENSORS:
+                # Streamed one expert at a time from a read-only view: the fused gate_up tensor alone is 6.7 GB as
+                # float32, so it is never materialized whole.
+                raw = np.memmap(src / t["file"], dtype="<u2", mode="r", shape=tuple(shape))
+                x = _Experts(raw)
+                if shape[-1] % block:
+                    raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {block}")
+                parts = [fn(x[e]) for e in range(shape[0])]            # one expert at a time bounds memory
+                blob = np.concatenate(parts)
+                errs = []
+                for e in range(min(a.check_experts, shape[0])):
+                    ref = x[e].reshape(-1)
+                    got = dequant(a.experts, parts[e], ref.size)
+                    errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
+                # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
+                w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
+                report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
+                               "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),
+                               "seconds": round(time.time() - t0, 1)})
+            elif len(shape) == 1:
+                x = load_bf16(src / t["file"], shape)
+                w.add_tensor(name, x.astype(np.float32))
+                report.append({"tensor": name, "format": "F32", "bytes": x.size * 4})
+            else:
+                bf = np.fromfile(src / t["file"], dtype="<u2").reshape(shape)
+                w.add_tensor(name, bf, raw_dtype=gguf.GGMLQuantizationType.BF16)
+                report.append({"tensor": name, "format": "BF16", "bytes": bf.size * 2})
+            print(f"{name}: {report[-1]['format']} {report[-1]['bytes'] / 1e6:.1f} MB", flush=True)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+    finally:
+        w.close()
     total = sum(r["bytes"] for r in report)
-    Path(a.out + ".report.json").write_text(json.dumps({"total_bytes": total, "tensors": report}, indent=1))
-    print(f"wrote {a.out}: {total / 1e9:.3f} GB of tensor data")
-    return 0
+    return {"total_bytes": total, "tensors": report}
 
 
 if __name__ == "__main__":
