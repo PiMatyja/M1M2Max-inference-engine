@@ -193,8 +193,16 @@ On top of that, the tuned config turns on two Metal tiers ([TUNING.md](TUNING.md
 - **The SSD tier** (`--ssd-cache-mib 20480 --ssd-cache-dir ~/.strata-cache`): a conversation displaced by another
   chat or a side request is parked on the SSD and restored on the next request that continues it, also across
   restarts. The host-memory tier is off (`--conversation-cache-mib 0`); conversations under 4096 tokens are not
-  parked (`--conversation-cache-min-tokens 4096`), and a park needs 1024 MiB of free RAM
-  (`--conversation-cache-min-free-mib 1024`).
+  parked (`--conversation-cache-min-tokens 4096`), and a park needs 384 MiB of free RAM
+  (`--conversation-cache-min-free-mib 384`).
+- **`"preload_starts": 3`** (config): the server keeps the last three chat starts of requests with tools in
+  `<config>.preload.json` and reads them right after the engine starts. A rebuilt engine trusts none of the old
+  SSD files, so without it the first chat after a rebuild reads its whole start again. It reads each start as a
+  chat would, so answers stay byte-identical.
+- **`"pin_tools": true`** (config, off in the tuned config): an agent's tools block, the same for every project,
+  becomes a pinned prefix, so a new chat in another project reads only its own instructions after it. The engine
+  then reads every agent prompt in two parts at that point, which can change a reply's rounding: answers are no
+  longer byte-identical to a run without it.
 
 Two request fields steer the cache:
 

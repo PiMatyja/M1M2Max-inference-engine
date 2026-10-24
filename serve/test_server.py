@@ -5618,3 +5618,60 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+class PreloadStarts(unittest.TestCase):
+    """"preload_starts": an agent's chat start is kept in the preload file and read again at the next engine start,
+    with or without "pin_tools" (without it, no pin goes to the engine, so the prompt is read as before)."""
+
+    TOOLS = [{"type": "function", "function": {"name": "read", "description": "Read a file.",
+                                               "parameters": {"type": "object", "properties": {}}}}]
+
+    class Recorder(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.calls = getattr(self, "calls", []) + [(list(ids), dict(sampling or {}))]
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def make(self, d, pin_tools=False):
+        tok = ByteTokenizer()
+        svc = Service(self.Recorder(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.preload_starts, svc.pin_tools = 3, pin_tools
+        svc.preload_path = str(Path(d) / "strata.preload.json")
+        return svc, tok
+
+    @staticmethod
+    def msgs(system, user="hi"):
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def test_keeps_the_start_without_pin_tools_and_reads_it_without_a_pin(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc, tok = self.make(d)
+            ids, _, _ = svc.prepare(self.msgs("rules " * 300), self.TOOLS, {}, req={})
+            saved = json.loads(Path(svc.preload_path).read_text(encoding="utf-8"))
+            self.assertEqual(len(saved), 1)
+            turn = tok.encode("<|im_start|>", parse_special=True)[0]
+            end = len(saved[0]["ids"])
+            self.assertEqual(saved[0]["ids"], ids[:end])
+            self.assertEqual(ids[end], turn)                      # the start ends where the user's turn begins
+            self.assertEqual(saved[0]["pin"], 0)
+            svc2, _ = self.make(d)
+            svc2.preload_saved_starts()
+            prompt, sampling = svc2.engine.calls[-1]
+            self.assertEqual(prompt[:end], saved[0]["ids"])
+            self.assertNotIn("strata_prefix", sampling)
+
+    def test_skips_side_requests(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc, _ = self.make(d)
+            svc.prepare(self.msgs("rules " * 300), None, {}, req={})          # no tools: a chat title, say
+            self.assertFalse(Path(svc.preload_path).exists())
+
+    def test_keeps_the_newest_three_once_each(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc, tok = self.make(d)
+            for name in ["a", "b", "a", "c", "d"]:
+                svc.prepare(self.msgs(f"project {name} " + "rules " * 300), self.TOOLS, {}, req={})
+            saved = json.loads(Path(svc.preload_path).read_text(encoding="utf-8"))
+            names = [tok.decode(s["ids"]).split("project ")[1][0] for s in saved]
+            self.assertEqual(names, ["d", "c", "a"])

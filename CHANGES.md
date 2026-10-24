@@ -118,3 +118,20 @@ interrupted pack is never mistaken for a finished one. `scripts/prepare-model.sh
 pyproject-metadata) as hashed source archives, and `scripts/python-env.sh` downloads each archive from PyPI,
 checks its hash, unpacks it, strips any binaries and installs it without build isolation, so the pack step works
 from the same venv as the server. `scripts/check.sh` no longer nests quotes inside an f-string.
+
+## 10. Shared chat starts
+
+An agent's chat start (the tools block and its instructions, about 11K tokens for Looper) was read again by every
+new chat in another project and by the first chat after each rebuild, because a rebuilt engine trusts none of the
+old SSD files. Two config keys fix it. `"preload_starts": N` (3 in the tuned config) keeps the last N chat starts of
+requests with tools in `<config>.preload.json` and reads them right after the engine starts; it reads each start
+as a chat would, so answers stay byte-identical. The opt-in `"pin_tools": true` makes the server mark the end of
+the tools block as a pinned prefix (`pin=N`), so a new chat in any project starts after it; the engine then reads
+every agent prompt in two parts there, so answers are no longer byte-identical to a run without it. The engine now
+skips parking the outgoing chat at a pinned prefix only when that chat added at most 1024 tokens past it, so a chat
+left for a new one is parked as before. The tuned RAM floor for parking drops from 1024 to 384 MiB: with the 47 GB
+model mapped, about 750 MiB was free and every park and restore was refused. Measured on an M2 Max with Looper's
+real start (10974 tokens): a new chat in the same project 1.3 s instead of 41 s, a new chat in another project
+8.6 s with `pin_tools` (8126 tokens reused), a switch back to an earlier chat 0.9-1.3 s, and a new chat right after
+a restart 1.6 s. Files: `serve/server.py`, `serve/test_server.py`, `src/program/generate.cpp`,
+`scripts/make-config.py`, `docs/GUIDE.md`, `docs/DETAILS.md`.

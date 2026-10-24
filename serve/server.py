@@ -3049,7 +3049,14 @@ class Service:
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
-        self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        # the config's "pin_tools": a request's tools block becomes a pinned prefix every new chat shares
+        self.pin_tools = False
+        # the config's "preload_starts": how many recent chat starts the next engine start reads before any chat
+        self.preload_starts = 0
+        self.preload_path = None                        # next to the config
+        self.preload = []
+        self.preload_lock = threading.Lock()
+        self.conv_log = ConvCacheLog()                # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -3946,9 +3953,72 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
+        pin = 0                                         # the tools pin ("pin_tools"), kept with the start
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+        elif req is not None and self.pin_tools and tools and not images:
+            req["strata_prefix"] = self.tools_prefix(messages, tools, kwargs, ids)
+            pin = req["strata_prefix"].get("tokens", 0)
+        if req is not None and tools and not images:
+            self.remember_start(ids, pin)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    PRELOAD_MIN = 1024                                     # a shorter start is read in a few seconds
+
+    def remember_start(self, ids, pin) -> None:
+        """With "preload_starts": keeps the system turn this prompt starts with (and its tools pin, 0 without
+        "pin_tools") in the preload file, most recent first, so the next engine start reads it before any chat."""
+        if self.preload_starts <= 0 or not self.preload_path:
+            return
+        turn = self.tok.encode("<|im_start|>", parse_special=True)[0]
+        end = next((i for i in range(max(pin, 1), len(ids) - 1) if ids[i] == turn), 0)
+        if end <= pin or end < self.PRELOAD_MIN:
+            return
+        start = {"ids": [int(t) for t in ids[:end]], "pin": int(pin)}
+        with self.preload_lock:
+            if self.preload and self.preload[0] == start:
+                return
+            self.preload = ([start] + [s for s in self.preload if s != start])[:self.preload_starts]
+            try:
+                tmp = Path(self.preload_path + ".tmp")
+                tmp.write_text(json.dumps(self.preload), encoding="utf-8")
+                os.replace(tmp, self.preload_path)
+            except OSError as e:
+                print(f"[strata] preload: the starts were not saved ({e})", flush=True)
+
+    def preload_saved_starts(self) -> None:
+        """Reads the preload file's starts into the engine's cache, oldest first, so the newest one ends in the root
+        slot; a chat that arrives meanwhile waits its turn as usual."""
+        try:
+            starts = json.loads(Path(self.preload_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        self.preload = [s for s in starts if isinstance(s, dict) and isinstance(s.get("ids"), list)][:self.preload_starts]
+        tail = self.tok.encode("<|im_start|>user\n.<|im_end|>\n<|im_start|>assistant\n", parse_special=True)
+        for s in reversed(self.preload):
+            t0 = time.time()
+            try:
+                pin = s.get("pin", 0) if self.pin_tools else 0
+                for _ in self.run(s["ids"] + tail, False, None, 1, {"strata_prefix": {"tokens": pin}} if pin else {},
+                                  threading.Event()):
+                    pass
+            except Exception as e:
+                print(f"[strata] preload: a saved start was not read ({e})", flush=True)
+                return
+            print(f"[strata] preload: read a saved start of {len(s['ids'])} tokens in {time.time() - t0:.0f} s",
+                  flush=True)
+
+    PIN_TOOLS_MIN = 1024                                   # a shorter tools block is cheaper to read than to pin
+
+    def tools_prefix(self, messages, tools, kwargs, ids) -> dict:
+        """With "pin_tools": the prompt up to where the system message's own text starts (the tools block, the same
+        for every project of one agent) as a pinned prefix, so a new chat in another project starts after it."""
+        first = messages[0] if messages else {}
+        text = first.get("content")
+        if first.get("role") not in ("system", "developer") or not isinstance(text, str) or not text:
+            return {}
+        head = self.resolve_prefix({"message": 0, "chars": 1}, messages, tools, kwargs, ids)
+        return head if head.get("tokens", 0) >= self.PIN_TOOLS_MIN else {}
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -7001,6 +7071,14 @@ def main() -> int:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    pt = cfg.get("pin_tools", False)
+    if not isinstance(pt, bool):
+        raise SystemExit(f"[strata] config \"pin_tools\" must be true or false, not {pt!r}")
+    svc.pin_tools = pt
+    ps = cfg.get("preload_starts", 0)
+    if isinstance(ps, bool) or not isinstance(ps, int) or not 0 <= ps <= 8:
+        raise SystemExit(f"[strata] config \"preload_starts\" must be a whole number from 0 to 8, not {ps!r}")
+    svc.preload_starts = ps
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
@@ -7027,6 +7105,7 @@ def main() -> int:
         svc.config_path = a.config                      # #564: the web page's Settings view
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+        svc.preload_path = str(Path(a.config).with_suffix("")) + ".preload.json"
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
             if svc.shared:
@@ -7042,6 +7121,8 @@ def main() -> int:
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
+    if svc.preload_starts and svc.preload_path and svc.loaded():
+        threading.Thread(target=svc.preload_saved_starts, daemon=True).start()
     svc.start_idle_unload()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host

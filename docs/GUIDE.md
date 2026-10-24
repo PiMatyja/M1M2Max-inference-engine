@@ -161,10 +161,11 @@ has `STRATA_METAL_STREAM=0` (resident), and `args` are:
 --pack <packs/iq3_xxs> --native <shard 1> --ple-gguf <shard 2> --expert-profile data/expert-profile.bin
 --expert-cache 64 --prefill auto --spec 8 --mtp <mtp/rt> --mtp-max-t 2 --max-context 131072 --kv int8 --mmap-experts
 --root-slot-tokens 16384 --ssd-cache-mib 20480 --ssd-cache-dir ~/.strata-cache
---conversation-cache-mib 0 --conversation-cache-min-tokens 4096 --conversation-cache-min-free-mib 1024
+--conversation-cache-mib 0 --conversation-cache-min-tokens 4096 --conversation-cache-min-free-mib 384
 ```
 
-plus `"reasoning_effort": "medium"`, `"reasoning_budget_tokens": 8000`, `"effort_position": "end"`, the
+plus `"reasoning_effort": "medium"`, `"reasoning_budget_tokens": 8000`, `"effort_position": "end"`,
+`"preload_starts": 3`, the
 sampling defaults (`temperature` 1.0, `top_p` 0.95, `top_k` 20), and the bookkeeping keys the server reads: `cwd`,
 `tokenizer` (the pack's `tokenizer/`), `model_name`, `log`, `lib_dirs`, `port`, `backend`.
 
@@ -187,6 +188,9 @@ What each setting buys:
 - Medium thinking with an 8K budget: the default (xhigh) overthinks and often never answers.
 - Root slot + SSD tier: the 14K-token agent system prompt is read once and kept (also across restarts); a side
   request (a chat title) or a chat switch no longer re-reads the whole chat.
+- `"preload_starts"`: the last three chat starts are read again right after every start, so the first chat after
+  a restart or a rebuild does not wait for them. The opt-in `"pin_tools"` also lets a new chat in another project
+  skip the shared tools block, at the cost of byte-identical answers ([DETAILS.md](DETAILS.md)).
 
 Start at login: a user LaunchAgent (RunAtLoad, no KeepAlive) that waits for the GPU limit from step 1, then runs
 the start command. With FileVault on, it starts only after someone logs in.

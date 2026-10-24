@@ -11296,10 +11296,12 @@ int main(int argc, char** argv) {
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
             // (a sibling query of the last one).  What the last query added past it is its private suffix - a few
             // dozen tokens, cheaper to read than the prefix's whole K/V is to copy to the host - so it is not parked:
-            // N queries keep one prefix.  A request without pin=, or one that resumes anywhere else, parks as before.
+            // N queries keep one prefix.  A request without pin=, or one that resumes anywhere else, parks as before;
+            // so does a conversation that went on past the prefix (a chat after a shared tools block), not a sibling.
+            constexpr int64_t kPinSiblingTail = 1024;
             bool pin_sibling = false;
             if (req_pin > 0 && req_ckpt && o.prompt_cache >= 3 && !from_live && !incoming && slot_source < 0 &&
-                !use_ssd && !use_root && resume == req_pin && live_ok)
+                !use_ssd && !use_root && resume == req_pin && live_ok && (int64_t) live.size() - resume <= kPinSiblingTail)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             // continuing the outgoing chat from one of its own checkpoints (its reply rendered back differently): the

@@ -22,13 +22,14 @@ args = ["--pack", pack, "--native", shard1, "--ple-gguf", shard2,
         "--expert-cache", "64", "--prefill", "auto", "--spec", "8", "--mtp", os.path.join(m, "mtp", "rt"),
         "--mtp-max-t", "2", "--max-context", str(a.context), "--kv", "int8", "--mmap-experts",
         "--root-slot-tokens", "16384", "--ssd-cache-mib", "20480", "--ssd-cache-dir", os.path.expanduser("~/.strata-cache"),
-        "--conversation-cache-mib", "0", "--conversation-cache-min-tokens", "4096", "--conversation-cache-min-free-mib", "1024"]
+        "--conversation-cache-mib", "0", "--conversation-cache-min-tokens", "4096", "--conversation-cache-min-free-mib", "384"]
 cfg = {"exe": os.path.join(ROOT, "build-metal", "strata"), "args": args, "cwd": ROOT,
        "tokenizer": os.path.join(pack, "tokenizer"), "model_name": "qwen3.8-flash-next-iq3_xxs",
        "log": os.path.join(ROOT, "strata-cached.log"), "lib_dirs": [], "port": a.port, "backend": "metal",
        "env": {"STRATA_METAL_STREAM": "0"},
        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-       "reasoning_effort": "medium", "reasoning_budget_tokens": 8000, "effort_position": "end"}
+       "reasoning_effort": "medium", "reasoning_budget_tokens": 8000, "effort_position": "end",
+       "preload_starts": 3}
 with open(a.out, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=1)
     f.write("\n")
