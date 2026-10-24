@@ -171,6 +171,7 @@ int main() {
     big.cap = 64ull << 20;
     big.min_free = 0;
 
+    std::string conversation_path;
     // ---- write a conversation from the window, read it back into another: every byte; refusals before any write
     {
         DiskStore store;
@@ -187,6 +188,12 @@ int main() {
         uint64_t bytes = 0;
         CHECK(store.write(ids, w.view(), checks, true, false, w.parts(), err, &bytes));
         CHECK(bytes > 0 && store.files() == 1);
+        for (const auto& de : fs::directory_iterator(dir))
+            if (de.path().extension() == ".skv") {
+                CHECK(conversation_path.empty());
+                conversation_path = de.path().string();
+            }
+        CHECK(!conversation_path.empty());
         const auto prompt = prompt_of(ids, ids.size(), 5);
         DiskStore::Match m = store.best(prompt);
         CHECK(m.id != 0 && m.tokens == 3001 && m.live);
@@ -246,12 +253,9 @@ int main() {
         bool cvec = false, root = false, touched = false, damaged = false;
         CHECK(store.read(m.id, prompt, 3001, &dv, rchecks, cvec, root, dst.parts(), cells, err, touched, damaged));
         CHECK(dst.same_prefix(w, 3001));
-        std::string path;
-        for (const auto& de : fs::directory_iterator(dir))
-            if (de.path().extension() == ".skv" && fs::file_size(de.path()) > 400000) path = de.path().string();
-        CHECK(!path.empty());
+        CHECK(fs::exists(conversation_path));
         {
-            std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+            std::fstream f(conversation_path, std::ios::in | std::ios::out | std::ios::binary);
             f.seekg(-1000, std::ios::end);
             char c = 0;
             f.read(&c, 1);
@@ -392,7 +396,10 @@ int main() {
         const auto m = store.best(prompt);
         uint64_t per = 0;
         for (uint64_t x : S) per += x;
-        CHECK(store.read_ram(m.id, 3001) == 2 * per + ids.size() * 4);
+        const uint64_t expected = 2 * per + (500 + 2500 + ids.size()) * 4 +
+                                  2 * sizeof(ConversationCheckpoint) + (7 + 5 * ck.size() + 5 * layers) * 24 +
+                                  ck.size() * 16 + 4096;
+        CHECK(store.read_ram(m.id, 3001) == expected);
         Window dst(layers, cells, L, S, 74);
         StateView dv = dst.view();
         std::vector<ConversationCheckpoint> got;
@@ -401,6 +408,45 @@ int main() {
         CHECK(got.size() == 2 && same_checkpoint(got[0], ck[0]) && same_checkpoint(got[1], ck[2]));
         CHECK(store.read(m.id, prompt_of(ids, 1200, -1), 1000, nullptr, got, cvec, root, dst.parts(), cells, err, touched, damaged));
         CHECK(got.size() == 2 && same_checkpoint(got[0], ck[0]) && same_checkpoint(got[1], ck[1]));
+    }
+    {
+        // Intermediate pins survive indexing and reopening, and admission includes every loaded token buffer.
+        fs::remove_all(dir);
+        std::string err;
+        Window w(layers, cells, L, S, 80), dst(layers, cells, L, S, 81);
+        std::vector<ConversationCheckpoint> ck;
+        for (int n : {500, 1000, 1800, 2500, 2900})
+            ck.push_back(state_of({ids.begin(), ids.begin() + n}, S, (uint32_t) n));
+        ck[1].pinned = ck[2].pinned = ck[4].pinned = true;
+        DiskStore store;
+        CHECK(store.open(dir.string(), big, id, err));
+        CHECK(store.write(ids, w.view(), ck, false, false, w.parts(), err));
+        uint64_t before = 0;
+        for (int restart = 0; restart < 2; ++restart) {
+            if (restart) CHECK(store.open(dir.string(), big, id, err));
+            const auto prompt = prompt_of(ids, 2600, -1);
+            const auto m = store.best(prompt);
+            CHECK(m.tokens == 2500);
+            const uint64_t ram = store.read_ram(m.id, m.tokens);
+            if (restart) CHECK(ram == before);
+            before = ram;
+            std::vector<ConversationCheckpoint> got;
+            bool cvec = false, root = false, touched = false, damaged = false;
+            CHECK(store.read(m.id, prompt, m.tokens, nullptr, got, cvec, root, dst.parts(), cells, err, touched, damaged));
+            CHECK(got.size() == 4);
+            uint64_t allocated = ids.size() * 4;
+            for (size_t i = 0; i < got.size(); ++i) {
+                CHECK(same_checkpoint(got[i], ck[i]));
+                allocated += got[i].bytes();
+            }
+            allocated += got.capacity() * sizeof(ConversationCheckpoint);
+            CHECK(ram >= allocated);
+            uint64_t per = 0;
+            for (uint64_t x : S) per += x;
+            const uint64_t scratch = (7 + 5 * ck.size() + 5 * layers) * 24 + ck.size() * 16 + 4096;
+            CHECK(ram == scratch + ids.size() * 4 + 4 * (per + sizeof(ConversationCheckpoint)) +
+                         (500 + 1000 + 1800 + 2500) * 4);
+        }
     }
     fs::remove_all(dir);
     std::printf("conversation_ssd_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);

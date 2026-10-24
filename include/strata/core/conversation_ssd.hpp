@@ -124,7 +124,7 @@ public:
     bool write(const std::vector<int32_t>& ids, const StateView& live, const std::vector<ConversationCheckpoint>& checks,
                bool cvec, bool root, const std::vector<Parts>& src, std::string& err, uint64_t* bytes = nullptr);
     /// What reading entry `id` back for a match at `upto` tokens needs in RAM: the checkpoints it loads, the deepest
-    /// at most `upto` and the shallowest (the root) - the others stay in the file only.
+    /// at most `upto`, the shallowest (the root), and pinned points, plus temporary read buffers.
     uint64_t read_ram(uint64_t id, int64_t upto) const;
     /// Reads entry `id` back for a prompt that matched it at `upto` tokens.  The file's tokens are read and checked
     /// against prompt[0, upto) BEFORE anything is written to `live` or `dst`.  `live` (the live state's
@@ -154,6 +154,7 @@ private:
         std::string path;
         std::vector<int32_t> ids;
         std::vector<int64_t> checks;
+        std::vector<uint8_t> check_pins;
         uint64_t bytes = 0, used = 0;
         bool root = false, foreign = false;
     };

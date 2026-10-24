@@ -86,6 +86,9 @@ struct Plan {
 };
 Plan plan(const DiskIdentity& id, int64_t tokens, uint32_t n_checks) {
     Plan p;
+    const size_t sections = 7 + 5 * n_checks + 5 * id.layers;
+    p.size.reserve(sections);
+    p.offset.reserve(sections);
     p.size.push_back((uint64_t) tokens * 4);
     p.size.push_back((uint64_t) n_checks * 16);
     for (int r = 0; r < 1 + (int) n_checks; ++r)
@@ -402,11 +405,12 @@ bool DiskStore::open(const std::string& dir, const Options& opt, const DiskIdent
                 for (size_t c = 0; c < h.n_checks; ++c) {
                     ok = ok && table[2 * c] >= 1 && table[2 * c] <= h.tokens;
                     en.checks.push_back(table[2 * c]);
+                    en.check_pins.push_back(table[2 * c + 1] != 0);
                 }
                 if (ok) { en.foreign = false; en.root = h.kind == 1; }
             }
         }
-        if (en.foreign) { en.ids.clear(); en.checks.clear(); }
+        if (en.foreign) { en.ids.clear(); en.checks.clear(); en.check_pins.clear(); }
         found.emplace_back((int64_t) fst.st_mtime, std::move(en));
     }
     std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -611,7 +615,10 @@ bool DiskStore::write(const std::vector<int32_t>& ids, const StateView& live,
     e.id = ++next_id_;
     e.path = path;
     e.ids = ids;
-    for (const auto& c : checks) e.checks.push_back((int64_t) c.ids.size());
+    for (const auto& c : checks) {
+        e.checks.push_back((int64_t) c.ids.size());
+        e.check_pins.push_back(c.pinned);
+    }
     e.bytes = pl.end;
     e.used = ++clock_;
     e.root = root;
@@ -637,10 +644,16 @@ bool keep_check(const std::vector<int64_t>& lens, size_t c, int64_t upto, bool p
 uint64_t DiskStore::read_ram(uint64_t id, int64_t upto) const {
     const Entry* e = find(id);
     if (e == nullptr) return 0;
-    uint64_t per = 0, n = 0;
+    uint64_t per = 0;
     for (uint64_t s : id_.state) per += s;
-    for (size_t c = 0; c < e->checks.size(); ++c) n += keep_check(e->checks, c, upto, false) ? 1 : 0;
-    return n * per + e->ids.size() * 4;
+    // The section plan, hash table, checkpoint table and file tokens coexist with the loaded checkpoints.
+    const uint64_t sections = 7 + 5 * e->checks.size() + 5 * id_.layers;
+    // Small temporary segment vectors and allocation overhead have a fixed reserve.
+    uint64_t ram = e->ids.size() * 4 + sections * 24 + e->checks.size() * 16 + 4096;
+    for (size_t c = 0; c < e->checks.size(); ++c)
+        if (keep_check(e->checks, c, upto, e->check_pins[c] != 0))
+            ram += per + (uint64_t) e->checks[c] * 4 + sizeof(ConversationCheckpoint);
+    return ram;
 }
 
 bool DiskStore::read(uint64_t id, const std::vector<int64_t>& prompt, int64_t upto, const StateView* live,
@@ -656,7 +669,7 @@ bool DiskStore::read(uint64_t id, const std::vector<int64_t>& prompt, int64_t up
     uncached(f.fd);
     FileHeader h;
     if (!read_all(f.fd, 0, &h, sizeof h, err)) { damaged = err.find("shorter") != std::string::npos; return false; }
-    if (!header_matches(h, id_) || (size_t) h.tokens != e->ids.size()) {
+    if (!header_matches(h, id_) || (size_t) h.tokens != e->ids.size() || h.n_checks != e->checks.size()) {
         err = "ssd cache: the file's header changed";
         damaged = true;
         return false;
@@ -697,16 +710,23 @@ bool DiskStore::read(uint64_t id, const std::vector<int64_t>& prompt, int64_t up
     bool at_check = live != nullptr;
     for (size_t c = 0; c < h.n_checks; ++c) {
         if (ct[2 * c] < 1 || ct[2 * c] > h.tokens) { err = "ssd cache: a checkpoint is out of range"; damaged = true; return false; }
+        if (ct[2 * c] != e->checks[c] || (ct[2 * c + 1] != 0) != (e->check_pins[c] != 0)) {
+            err = "ssd cache: the checkpoint index changed";
+            damaged = true;
+            return false;
+        }
         at_check = at_check || ct[2 * c] == upto;
     }
     if (!at_check) { err = "ssd cache: no saved state at the matched point"; damaged = true; return false; }
     // the checkpoints a restore keeps (keep_check: the matched/deepest and the root; deeper ones would go at once)
     std::vector<ConversationCheckpoint> fchecks;
-    std::vector<int64_t> lens;
-    for (size_t c = 0; c < h.n_checks; ++c) lens.push_back(ct[2 * c]);
+    size_t selected = 0;
+    for (size_t c = 0; c < e->checks.size(); ++c)
+        selected += keep_check(e->checks, c, upto, e->check_pins[c] != 0);
     try {
+        fchecks.reserve(selected);
         for (size_t c = 0; c < h.n_checks; ++c) {
-            if (!keep_check(lens, c, upto, ct[2 * c + 1] != 0)) continue;
+            if (!keep_check(e->checks, c, upto, e->check_pins[c] != 0)) continue;
             ConversationCheckpoint k;
             std::vector<uint8_t>* p[5] = {&k.gdn, &k.ple, &k.tails, &k.dead, &k.block_pos};
             for (size_t i = 0; i < 5; ++i) {
