@@ -31,6 +31,13 @@ Greedy answers are bit-identical to stock Strata for a fixed drafting setup.
   to 20480 MiB of SSD cache.
 - Network only for steps 2, 4 and 5 below.
 
+## Setup window
+
+After installing Apple's Command Line Tools, double-click `Setup.command` to build and open a native setup
+window with prerequisite checks, Install from Source, GPU Memory, Start, Stop, Status and a log. CMake and a
+supported Python are still required. This is a source-built launcher, not a prebuilt installer.
+See [docs/SETUP_APP.md](docs/SETUP_APP.md) for prerequisites and limits.
+
 ## Steps
 
 Each step is one script. The full walk-through, with what every command does, is docs/GUIDE.md.

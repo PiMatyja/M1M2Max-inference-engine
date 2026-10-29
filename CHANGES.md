@@ -135,3 +135,19 @@ real start (10974 tokens): a new chat in the same project 1.3 s instead of 41 s,
 8.6 s with `pin_tools` (8126 tokens reused), a switch back to an earlier chat 0.9-1.3 s, and a new chat right after
 a restart 1.6 s. Files: `serve/server.py`, `serve/test_server.py`, `src/program/generate.cpp`,
 `scripts/make-config.py`, `docs/GUIDE.md`, `docs/DETAILS.md`.
+
+## 11. Source-built macOS setup window
+
+`Setup.command` builds a local AppKit app with prerequisite checks, source and model folder selection, Install from
+Source, a separate administrator-approved GPU memory setting, Start, Stop, Status and a bounded log. Installation
+runs the existing verified scripts in order and preserves an existing run config. Stop and Quit terminate only the
+server owned by this app and let it close its engine. Unsupported chips, memory below 64 GB and macOS below 15
+are refused. No kernels, inference defaults, downloader or updater changed. No prebuilt app is distributed.
+Files: `macos/SetupApp/main.swift`, `scripts/build-setup-app.sh`, `scripts/setup-app.sh`,
+`scripts/setup-app-memory.sh`, `Setup.command`, `macos/supervise.py`, `macos/tests/test_setup.py`,
+`macos/tests/test_supervise.py`, `docs/SETUP_APP.md`, `README.md`.
+The orchestration tests use synthetic tools and stages without downloads or GPU changes; a review found that stopping
+during the model load could leave the engine running, so Start now runs under `macos/supervise.py`, which owns the
+whole process group and reaps it before the window allows a new Start. The tests (15) and a local build pass on an
+unsupported machine (Apple M4 Max, 36 GB, macOS 26), which the preflight refuses by design. Clean-machine
+installation and interactive UI behavior still need a manual pass on M1 Max / M2 Max.
